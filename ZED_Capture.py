@@ -1,18 +1,32 @@
-import pyzed.sl as sl
-import cv2
-import threading
-import time
 import os
-import json
 import sys
+import time
+import csv
+import cv2
+import random
+import argparse
+import logging
+import pathlib
+import threading
+
+import pyzed.sl as sl
+import mecademicpy.robot as mdr
+import mecademicpy.robot_initializer as initializer
+import mecademicpy.tools as tools
 
 # 저장 폴더
 OUTPUT_DIR = "./dataset/ZED_Captures"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--run-tag", default=None, help="출력 폴더 접미사 (예: 20th)")
+    return p.parse_args()
+
+
 class ZedCamera(threading.Thread):
-    def __init__(self, serial_number, output_subdir, start_event, stop_event, duration=30):
-        super().__init__()
+    def __init__(self, serial_number, output_subdir, start_event, stop_event):
+        super().__init__(daemon=True)
         self.serial_number = serial_number
         self.output_dir = os.path.join(OUTPUT_DIR, output_subdir)
         os.makedirs(self.output_dir, exist_ok=True)
@@ -20,14 +34,12 @@ class ZedCamera(threading.Thread):
         self.zed = sl.Camera()
         self.runtime_params = sl.RuntimeParameters()
         self.start_event = start_event
-        self.duration = duration
         self.stop_event = stop_event
         self.ready = False
 
-
     def init_camera(self):
         init_params = sl.InitParameters()
-        init_params.camera_resolution = sl.RESOLUTION.HD1200 # HD1200
+        init_params.camera_resolution = sl.RESOLUTION.HD1200
         init_params.camera_fps = 30
         init_params.set_from_serial_number(self.serial_number)
         init_params.depth_mode = sl.DEPTH_MODE.NEURAL
@@ -45,55 +57,36 @@ class ZedCamera(threading.Thread):
             print(f"Camera {self.serial_number} not ready. Skipping capture.")
             return
 
-        left_image = sl.Mat()
-        right_image = sl.Mat()
-
+        left_image, right_image = sl.Mat(), sl.Mat()
         self.start_event.wait()
         print(f"Camera {self.serial_number} started capturing")
-        start_time = time.time()
 
-        while time.time() - start_time < self.duration or not self.stop_event.is_set():
+        while not self.stop_event.is_set():
             if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
-                
                 self.zed.retrieve_image(left_image, sl.VIEW.LEFT)
-                timestamp_left = time.time()
-                timestamp_left_str = f"{timestamp_left:.3f}"
-                
+                t_left = time.time()
                 self.zed.retrieve_image(right_image, sl.VIEW.RIGHT)
-                timestamp_right = time.time()
-                timestamp_right_str = f"{timestamp_right:.3f}"
-                
+                t_right = time.time()
+
                 left_data = left_image.get_data()
                 right_data = right_image.get_data()
-                
-                left_path = os.path.join(self.output_dir, f"zed_{self.serial_number}_left_{timestamp_left_str}.jpg")
-                right_path = os.path.join(self.output_dir, f"zed_{self.serial_number}_right_{timestamp_right_str}.jpg")
 
-                success_left = cv2.imwrite(left_path, left_data[:, :, :3])
-                success_right = cv2.imwrite(right_path, right_data[:, :, :3])
+                left_path = os.path.join(self.output_dir, f"zed_{self.serial_number}_left_{t_left:.3f}.jpg")
+                right_path = os.path.join(self.output_dir, f"zed_{self.serial_number}_right_{t_right:.3f}.jpg")
 
-                if not (success_left and success_right):
-                    print(f"Camera {self.serial_number} - Failed to save images at {timestamp_right_str:.3f}")
+                ok_l = cv2.imwrite(left_path, left_data[:, :, :3])
+                ok_r = cv2.imwrite(right_path, right_data[:, :, :3])
+                if not (ok_l and ok_r):
+                    print(f"Camera {self.serial_number} - Failed to save images")
 
         self.zed.close()
         print(f"Camera {self.serial_number} stopped")
-
-import logging
-import pathlib
-from datetime import datetime
-
-import mecademicpy.robot as mdr
-import mecademicpy.robot_initializer as initializer
-import mecademicpy.tools as tools
-
 
 class RobotManager:
     def __init__(self, address="192.168.0.100"):
         self.address = address
         self.robot = None
         self.logger = logging.getLogger(__name__)
-        self._log_cm = None  # FileLogger 컨텍스트 핸들
-        self._log_active = False
 
     def __enter__(self):
         tools.SetDefaultLogger(logging.INFO, f'{pathlib.Path(__file__).stem}.log')
@@ -103,17 +96,6 @@ class RobotManager:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._log_active:
-            try:
-                self._log_cm.__exit__(None, None, None)
-                self.logger.info('FileLogger stopped (in __exit__).')
-            except Exception as e:
-                self.logger.warning(f'logger close failed in __exit__: {e}')
-            finally:
-                self._log_active = False
-                self._log_cm = None
-
-        # 2) 로봇 정리
         if self.robot and self.robot.IsConnected():
             try:
                 if self.robot.GetStatusRobot().error_status:
@@ -130,9 +112,7 @@ class RobotManager:
         if self.robot:
             self.robot.__exit__(exc_type, exc_value, traceback)
 
-
     def setup(self):
-        """로봇 초기화 & homing"""
         self.logger.info('Activating and homing robot...')
         initializer.reset_sim_mode(self.robot)
         initializer.reset_motion_queue(self.robot, activate_home=True)
@@ -142,11 +122,10 @@ class RobotManager:
         self.robot.SetCartLinVel(100)
         self.robot.SetJointVel(1)
         self.robot.SetBlending(50)
-        self.robot.MoveJoints(*([0] * self.robot.GetRobotInfo().num_joints))
+        # self.robot.MoveJoints(*([0] * self.robot.GetRobotInfo().num_joints))
         self.robot.WaitIdle(30)
 
     def move_points(self, points):
-        """포인트 리스트대로 이동"""
         if tools.robot_model_is_meca500(self.robot.GetRobotInfo().robot_model):
             self.robot.SetConf(1, 1, 1)
             for idx, (x, y, z, a, b, r) in enumerate(points):
@@ -158,113 +137,127 @@ class RobotManager:
                 f'Unsupported robot model: {self.robot.GetRobotInfo().robot_model}'
             )
         self.logger.info('Finished executing move_points.')
-    
-    def start_logging(self, period=0.01, filename_prefix="trajectory",
-                      base_fields=None):
-        if self._log_active:
-            self.logger.info('Logging already active; ignoring start_logging().')
-            return
 
-        if base_fields is None:
-            base_fields = ["TargetJointPos", "JointPos"]
 
-        ts_candidates = ("TimeStamp", "Timestamp", "Time")
-        last_err = None
-        ts_used = None
+class RtSampler(threading.Thread):
+    """비-RT 폴링으로 조인트/EE 포즈를 epoch 기준으로 CSV 저장"""
+    def __init__(self, robot, out_csv, rate_hz=100):
+        super().__init__(daemon=True)
+        self.robot = robot
+        self.out_csv = out_csv
+        self.dt = 1.0 / float(rate_hz)
+        self.stop_evt = threading.Event()
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_name = f"{filename_prefix}_{stamp}"
+    def stop(self):
+        self.stop_evt.set()
 
-        for ts in ts_candidates:
-            try:
-                fields = [ts] + base_fields
-                cm = self.robot.FileLogger(period, fields=fields, file_name=file_name)
-                cm.__enter__()  # 수동 진입: 컨텍스트 유지(로봇 동작 동안 계속 기록)
-                self._log_cm = cm
-                self._log_active = True
-                ts_used = ts
-                self.logger.info(f"FileLogger started: {file_name}.csv (fields={fields})")
-                break
-            except Exception as e:
-                last_err = e
-                continue
+    def run(self):
+        with open(self.out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "epoch_s",
+                "joint_angle_1","joint_angle_2","joint_angle_3",
+                "joint_angle_4","joint_angle_5","joint_angle_6",
+                "EE_x","EE_y","EE_z","EE_a","EE_b","EE_r"
+            ])
+            next_t = time.time()
+            while not self.stop_evt.is_set():
+                t = time.time()
 
-        if not self._log_active:
-            self.logger.error(
-                f"Failed to start FileLogger with timestamp fields. "
-                f"Last error: {last_err}"
-            )
-            raise
+                # 조인트
+                q = None
+                for name in ("GetJoints", "GetJointPos", "GetJointAngles"):
+                    fn = getattr(self.robot, name, None)
+                    if callable(fn):
+                        try:
+                            q = list(fn())
+                            break
+                        except Exception:
+                            pass
 
-        return ts_used, file_name
-    
-    def stop_logging(self):
-        if not self._log_active:
-            self.logger.info('Logging is not active; ignoring stop_logging().')
-            return
-        try:
-            self._log_cm.__exit__(None, None, None)  # EndLogging
-            self.logger.info('FileLogger stopped.')
-        except Exception as e:
-            self.logger.warning(f'FileLogger stop failed: {e}')
-        finally:
-            self._log_active = False
-            self._log_cm = None
+                # EE 포즈
+                p = None
+                for name in ("GetPose", "GetPoseXYZABC", "GetCartesianPose"):
+                    fn = getattr(self.robot, name, None)
+                    if callable(fn):
+                        try:
+                            p = list(fn())
+                            break
+                        except Exception:
+                            pass
 
+                if q is not None and len(q) >= 6 and p is not None and len(p) >= 6:
+                    w.writerow([f"{t:.6f}"] + q[:6] + p[:6])
+
+                next_t += self.dt
+                sleep_dt = next_t - time.time()
+                if sleep_dt > 0:
+                    time.sleep(sleep_dt)
 
 
 def main():
+    args = parse_args()
+
+    global OUTPUT_DIR
+
+    if args.run_tag:
+        OUTPUT_DIR = f"./dataset/ZED_Captures_{args.run_tag}"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     start_event = threading.Event()
     stop_event = threading.Event()
-    duration = 30  # 30초 동안 촬영
 
     cameras = [
-        ZedCamera(serial_number=41182735, output_subdir="view1", start_event=start_event, stop_event=stop_event, duration=duration),
-        ZedCamera(serial_number=49429257, output_subdir="view2", start_event=start_event, stop_event=stop_event, duration=duration),
-        ZedCamera(serial_number=44377151, output_subdir="view3", start_event=start_event, stop_event=stop_event, duration=duration),
-        ZedCamera(serial_number=49045152, output_subdir="view4", start_event=start_event, stop_event=stop_event, duration=duration),
+        ZedCamera(41182735, "view1", start_event, stop_event),
+        ZedCamera(49429257, "view2", start_event, stop_event),
+        ZedCamera(44377151, "view3", start_event, stop_event),
+        ZedCamera(49045152, "view4", start_event, stop_event),
     ]
 
     for cam in cameras:
         cam.init_camera()
-
     while not all(cam.ready for cam in cameras):
         print("Waiting for all cameras to be ready...")
         time.sleep(1)
-
     for cam in cameras:
         cam.start()
 
     print("Starting data capture in 3 seconds...")
-    time.sleep(2)
+    time.sleep(3)
     start_event.set()
 
     try:
         with RobotManager() as manager:
             manager.setup()
-            manager.start_logging(period=0.01, filename_prefix="trajectory")
+
+            sampler_csv = os.path.join(OUTPUT_DIR, f"robot_rt_{time.time():.3f}.csv")
+            sampler = RtSampler(manager.robot, sampler_csv, rate_hz=100)
+            sampler.start()
+
             manager.move_points([
-                (245.330857, 71.314158, 70.579333, -174.999591, 14.169026, 161.421036)
+                # (245.330857, 71.314158, 70.579333, -174.999591, 14.169026, 161.421036)
+                # (218.546433, -131.00556, 70, 172.224203, 13.788987, -151.514115)
+                (151.111573, 83.935818, 62.537654, -179.385704, 1.156863, 152.029116)
             ])
+
+            # 로봇 동작 종료 직후: 카메라 먼저 정지 → 샘플러 종료
             stop_event.set()
-            manager.stop_logging()
+            sampler.stop()
+            sampler.join()
+            noise = random.randint(-20, 20)
+            manager.move_points([
+                (190.0+noise, 0.0+noise, 308.0+noise, 0.0+noise, 90.0+noise, 0.0+noise)
+            ])
+
     finally:
         for cam in cameras:
             cam.join()
         print("Data collection finished.")
 
+
 if __name__ == "__main__":
     main()
 
 # white block:
-#     joint angles: 15.991698, 65.637785, -23.417432, 1.460125, 32.800052, -3.088784\
+#     joint angles: 15.991698, 65.637785, -23.417432, 1.460125, 32.800052, -3.088784
 #     EE pose: 245.330857, 71.314158, 70.579333, -174.999591, 14.169026, 161.421036
-
-
-# 로봇 시간 후처리 
-# import pandas as pd
-# from datetime import datetime, timedelta
-# start_time = datetime.now()
-# df = pd.read_csv("trajectory_20250926_153000.csv")
-# df["WallClock"] = [start_time + timedelta(seconds=t) for t in df["TimeStamp"]]
-# print(df.head())

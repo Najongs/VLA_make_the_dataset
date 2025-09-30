@@ -7,8 +7,9 @@ __pycache__/
 *.so
 
 *.zip
+*.tar.gz
 dataset/
-
+dataset_1th/
 # Distribution / packaging
 .Python
 build/

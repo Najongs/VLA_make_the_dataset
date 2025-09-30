@@ -84,8 +84,9 @@ class RobotManager:
         last_err = None
         ts_used = None
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_name = f"{filename_prefix}_{stamp}"
+        now = datetime.now()
+        stamp_ms = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        file_name = f"{filename_prefix}_{stamp_ms}"
 
         for ts in ts_candidates:
             try:
